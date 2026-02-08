@@ -1,8 +1,12 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Response
+from fastapi.responses import StreamingResponse
 from typing import List
 import time
+import io
 from app.database import get_db
-from app.schemas import InvoiceCreate, InvoiceResponse, ClientResponse, ProductResponse, InvoiceItemResponse
+from app.schemas import InvoiceCreate, InvoiceResponse, ClientResponse, ProductResponse, InvoiceItemResponse, InvoiceStatusUpdate
+from app.services.pdf_generator import generate_invoice_pdf
+from app.services.email_service import send_invoice_email
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
@@ -46,8 +50,8 @@ def create_invoice(invoice_data: InvoiceCreate):
             address_snapshot = client['address']
 
             cursor.execute("""
-                INSERT INTO invoices (invoice_no, issue_date, due_date, client_id, address, tax, total)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO invoices (invoice_no, issue_date, due_date, client_id, address, tax, total, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 invoice_no,
                 invoice_data.issue_date.isoformat(),
@@ -55,7 +59,8 @@ def create_invoice(invoice_data: InvoiceCreate):
                 invoice_data.client_id,
                 address_snapshot,
                 tax,
-                final_total
+                final_total,
+                'DRAFT' # Default status
             ))
             invoice_id = cursor.lastrowid
 
@@ -66,11 +71,6 @@ def create_invoice(invoice_data: InvoiceCreate):
                     VALUES (?, ?, ?)
                 """, (invoice_id, item.product_id, item.quantity))
             
-            # Commit handled by context manager on exit
-            
-            # 6. Fetch for Response
-            # We need to manually construct response or fetch again.
-            # Fetching again is safer to ensure DB state matches.
             return _get_invoice_internal(conn, invoice_id)
 
     except HTTPException:
@@ -119,7 +119,74 @@ def delete_invoice(invoice_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+@router.patch("/{invoice_id}/status", response_model=InvoiceResponse)
+def update_invoice_status(invoice_id: int, status_update: InvoiceStatusUpdate):
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM invoices WHERE id = ?", (invoice_id,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Invoice not found")
+            
+            cursor.execute("UPDATE invoices SET status = ? WHERE id = ?", (status_update.status, invoice_id))
+            return _get_invoice_internal(conn, invoice_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@router.get("/{invoice_id}/pdf")
+def get_invoice_pdf(invoice_id: int):
+    try:
+        with get_db() as conn:
+            invoice_data = _get_invoice_internal_dict(conn, invoice_id)
+            pdf_bytes = generate_invoice_pdf(invoice_data)
+            
+            return StreamingResponse(
+                io.BytesIO(pdf_bytes), 
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename=invoice_{invoice_data['invoice_no']}.pdf"}
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating PDF: {str(e)}")
+
+@router.post("/{invoice_id}/send")
+def send_invoice(invoice_id: int):
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            invoice_data = _get_invoice_internal_dict(conn, invoice_id)
+            
+            # Generate PDF
+            pdf_bytes = generate_invoice_pdf(invoice_data)
+            
+            # Send Email (Mock)
+            # using a dummy email for now as client table doesn't have email field yet
+            to_email = "client@example.com" 
+            subject = f"Invoice {invoice_data['invoice_no']} from xAI Tutor"
+            body = f"Dear {invoice_data['client']['name']},\n\nPlease find attached your invoice.\n\nTotal: ${invoice_data['total']:.2f}"
+            
+            send_invoice_email(to_email, subject, body, pdf_bytes)
+            
+            # Update Status to SENT
+            cursor.execute("UPDATE invoices SET status = 'SENT' WHERE id = ?", (invoice_id,))
+            
+            return {"message": "Invoice sent successfully", "status": "SENT"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error sending invoice: {str(e)}")
+
+
 def _get_invoice_internal(conn, invoice_id):
+    # This returns Pydantic model
+    data = _get_invoice_internal_dict(conn, invoice_id)
+    return InvoiceResponse(**data)
+
+def _get_invoice_internal_dict(conn, invoice_id):
+    # Helper to get dictionary data for both API response and PDF generation
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM invoices WHERE id = ?", (invoice_id,))
     invoice = cursor.fetchone()
@@ -140,21 +207,31 @@ def _get_invoice_internal(conn, invoice_id):
     items_response = []
     for item in items:
         line_total = item['quantity'] * item['product_price']
-        items_response.append(InvoiceItemResponse(
-            id=item['id'],
-            product=ProductResponse(id=item['product_id'], name=item['product_name'], price=item['product_price']),
-            quantity=item['quantity'],
-            line_total=line_total
-        ))
+        items_response.append({
+            "id": item['id'],
+            "product": {
+                "id": item['product_id'],
+                "name": item['product_name'],
+                "price": item['product_price']
+            },
+            "quantity": item['quantity'],
+            "line_total": line_total
+        })
 
-    return InvoiceResponse(
-        id=invoice['id'],
-        invoice_no=invoice['invoice_no'],
-        issue_date=invoice['issue_date'],
-        due_date=invoice['due_date'],
-        client=ClientResponse(id=client['id'], name=client['name'], address=client['address'], company_reg_no=client['company_reg_no']),
-        items=items_response,
-        tax=invoice['tax'],
-        total=invoice['total'],
-        address_snapshot=invoice['address']
-    )
+    return {
+        "id": invoice['id'],
+        "invoice_no": invoice['invoice_no'],
+        "issue_date": invoice['issue_date'],
+        "due_date": invoice['due_date'],
+        "client": {
+            "id": client['id'],
+            "name": client['name'],
+            "address": client['address'],
+            "company_reg_no": client['company_reg_no']
+        },
+        "items": items_response,
+        "tax": invoice['tax'],
+        "total": invoice['total'],
+        "address_snapshot": invoice['address'],
+        "status": invoice['status'] if invoice['status'] else "DRAFT"
+    }

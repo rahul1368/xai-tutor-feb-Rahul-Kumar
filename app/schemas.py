@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Literal
 from datetime import date
 
 class InvoiceItemCreate(BaseModel):
@@ -12,6 +12,9 @@ class InvoiceCreate(BaseModel):
     due_date: date
     items: List[InvoiceItemCreate]
     tax_amount: Optional[float] = 0.0
+
+class InvoiceStatusUpdate(BaseModel):
+    status: Literal['DRAFT', 'SENT', 'PAID', 'OVERDUE']
 
 class ProductResponse(BaseModel):
     id: int
@@ -40,6 +43,7 @@ class InvoiceResponse(BaseModel):
     tax: float
     total: float
     address_snapshot: str
+    status: str
 
     class Config:
         from_attributes = True

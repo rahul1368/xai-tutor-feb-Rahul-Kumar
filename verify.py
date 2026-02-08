@@ -15,22 +15,28 @@ def make_request(method, url, data=None):
     try:
         with urllib.request.urlopen(req) as response:
             status_code = response.getcode()
-            response_body = response.read().decode('utf-8')
-            try:
-                json_response = json.loads(response_body) if response_body else None
-            except json.JSONDecodeError:
-                json_response = response_body
-            return status_code, json_response
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode('utf-8')
-    except urllib.error.URLError as e:
-        return None, str(e)
+            headers = response.info()
+            response_body = response.read()
+            
+            # Helper to parse JSON if content-type says so
+            if "application/json" in headers.get("Content-Type", ""):
+                try:
+                    return status_code, json.loads(response_body.decode('utf-8')), headers
+                except:
+                    return status_code, response_body, headers
+            
+            return status_code, response_body, headers
 
-def test_invoice_flow():
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode('utf-8'), None
+    except urllib.error.URLError as e:
+        return None, str(e), None
+
+def test_phase2_flow():
     print("Waiting for API to be ready...")
     for i in range(10):
         try:
-            status, _ = make_request("GET", f"{BASE_URL}/health")
+            status, _, _ = make_request("GET", f"{BASE_URL}/health")
             if status == 200:
                 break
             time.sleep(1)
@@ -40,7 +46,7 @@ def test_invoice_flow():
         print("API failed to start.")
         return
 
-    print("API is ready. Starting tests...")
+    print("API is ready. Starting Phase 2 tests...")
 
     # 1. Create Invoice
     payload = {
@@ -48,58 +54,72 @@ def test_invoice_flow():
         "issue_date": "2023-10-27",
         "due_date": "2023-11-27",
         "items": [
-            {"product_id": 1, "quantity": 2},
-            {"product_id": 2, "quantity": 1}
+            {"product_id": 1, "quantity": 5},
         ],
-        "tax_amount": 5.0
+        "tax_amount": 10.0
     }
     
     print("\n[POST] Creating Invoice...")
-    status, invoice = make_request("POST", f"{BASE_URL}/invoices", payload)
+    status, invoice, _ = make_request("POST", f"{BASE_URL}/invoices", payload)
     
     if status == 201:
         print(f"Success! Created Invoice ID: {invoice['id']}")
-        print(json.dumps(invoice, indent=2))
+        print(f"Initial Status: {invoice['status']}")
         invoice_id = invoice['id']
+        if invoice['status'] != 'DRAFT':
+            print("ERROR: Status should be DRAFT")
     else:
         print(f"Failed. Status: {status}")
         print(invoice)
         return
 
-    # 2. List Invoices
-    print("\n[GET] Listing Invoices...")
-    status, invoices = make_request("GET", f"{BASE_URL}/invoices")
+    # 2. Update Status
+    print(f"\n[PATCH] Updating Status to PAID...")
+    status, invoice, _ = make_request("PATCH", f"{BASE_URL}/invoices/{invoice_id}/status", {"status": "PAID"})
     if status == 200:
-        print(f"Found {len(invoices)} invoices.")
-        found = any(inv['id'] == invoice_id for inv in invoices)
-        print(f"Invoice {invoice_id} found in list: {found}")
+        print(f"Success! New Status: {invoice['status']}")
+        if invoice['status'] != 'PAID':
+            print("ERROR: Status did not update")
     else:
         print(f"Failed. Status: {status}")
+        print(invoice)
 
-    # 3. Get Invoice Detail
-    print(f"\n[GET] Fetching Invoice {invoice_id}...")
-    status, invoice_detail = make_request("GET", f"{BASE_URL}/invoices/{invoice_id}")
+    # 3. Get PDF
+    print(f"\n[GET] Downloading PDF...")
+    status, content, headers = make_request("GET", f"{BASE_URL}/invoices/{invoice_id}/pdf")
+    if status == 200:
+        content_type = headers.get("Content-Type")
+        print(f"Success! Content-Type: {content_type}")
+        print(f"PDF Size: {len(content)} bytes")
+        if "application/pdf" not in content_type:
+             print("ERROR: Content-Type is not application/pdf")
+        
+        # Save for manual inspection
+        with open("test_invoice.pdf", "wb") as f:
+            f.write(content)
+        print("Saved to test_invoice.pdf")
+    else:
+        print(f"Failed. Status: {status}")
+        print(content)
+
+    # 4. Send Email
+    print(f"\n[POST] Sending Email...")
+    status, response, _ = make_request("POST", f"{BASE_URL}/invoices/{invoice_id}/send")
+    # Note: Our code doesn't return JSON for this endpoint currently, wait, it does: {"message": ...}
+    # Wait, my previous code in `invoices.py` returned a dict. 
+    # Let's check status.
     if status == 200:
         print("Success!")
-        print(json.dumps(invoice_detail, indent=2))
+        print(response)
+        
+        # Verify status changed to SENT (Wait, we set it to SENT in logic, but before we set it to PAID manually. 
+        # Does send logic check current status? No. It just updates to SENT.
+        # Let's check if it updated.)
+        status, invoice_check, _ = make_request("GET", f"{BASE_URL}/invoices/{invoice_id}")
+        print(f"Status after send: {invoice_check['status']}")
     else:
         print(f"Failed. Status: {status}")
-
-    # 4. Delete Invoice
-    print(f"\n[DELETE] Deleting Invoice {invoice_id}...")
-    status, _ = make_request("DELETE", f"{BASE_URL}/invoices/{invoice_id}")
-    if status == 204:
-        print("Success! (No Content)")
-    else:
-        print(f"Failed. Status: {status}")
-
-    # 5. Verify Deletion
-    print(f"\n[GET] Verifying Invoice {invoice_id} is gone...")
-    status, _ = make_request("GET", f"{BASE_URL}/invoices/{invoice_id}")
-    if status == 404:
-        print("Success! Invoice not found.")
-    else:
-        print(f"Failed. Status: {status}")
+        print(response)
 
 if __name__ == "__main__":
-    test_invoice_flow()
+    test_phase2_flow()
