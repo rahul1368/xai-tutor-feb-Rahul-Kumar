@@ -47,3 +47,10 @@ class InvoiceResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class PaginatedInvoiceResponse(BaseModel):
+    items: List[InvoiceResponse]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int

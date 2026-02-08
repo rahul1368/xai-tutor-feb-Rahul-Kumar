@@ -1,10 +1,12 @@
-from fastapi import APIRouter, HTTPException, status, Response
+from fastapi import APIRouter, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
-from typing import List
+from typing import List, Optional
+from datetime import date
 import time
 import io
+import math
 from app.database import get_db
-from app.schemas import InvoiceCreate, InvoiceResponse, ClientResponse, ProductResponse, InvoiceItemResponse, InvoiceStatusUpdate
+from app.schemas import InvoiceCreate, InvoiceResponse, PaginatedInvoiceResponse, InvoiceStatusUpdate, ClientResponse, ProductResponse, InvoiceItemResponse
 from app.services.pdf_generator import generate_invoice_pdf
 from app.services.email_service import send_invoice_email
 
@@ -46,7 +48,8 @@ def create_invoice(invoice_data: InvoiceCreate):
             final_total = total_amount + tax
 
             # 4. Create Invoice Record
-            invoice_no = f"INV-{int(time.time())}"
+            import uuid
+            invoice_no = f"INV-{uuid.uuid4().hex[:8].upper()}"
             address_snapshot = client['address']
 
             cursor.execute("""
@@ -78,18 +81,66 @@ def create_invoice(invoice_data: InvoiceCreate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@router.get("", response_model=List[InvoiceResponse])
-def list_invoices():
+@router.get("", response_model=PaginatedInvoiceResponse)
+def list_invoices(
+    client_id: Optional[int] = None,
+    status: Optional[str] = None,
+    date_from: Optional[date] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100)
+):
     try:
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM invoices")
+            
+            # Build Query
+            query = "SELECT * FROM invoices"
+            count_query = "SELECT COUNT(*) FROM invoices"
+            params = []
+            conditions = []
+            
+            if client_id:
+                conditions.append("client_id = ?")
+                params.append(client_id)
+            if status:
+                conditions.append("status = ?")
+                params.append(status)
+            if date_from:
+                conditions.append("issue_date >= ?")
+                params.append(date_from.isoformat())
+            
+            if conditions:
+                where_clause = " WHERE " + " AND ".join(conditions)
+                query += where_clause
+                count_query += where_clause
+            
+            # Count total
+            cursor.execute(count_query, params)
+            total_items = cursor.fetchone()[0]
+            
+            # Pagination
+            offset = (page - 1) * page_size
+            query += " LIMIT ? OFFSET ?"
+            params.extend([page_size, offset])
+            
+            # Execute Main Query
+            cursor.execute(query, params)
             invoices = cursor.fetchall()
             
             results = []
             for invoice in invoices:
                 results.append(_get_invoice_internal(conn, invoice['id']))
-            return results
+            
+            total_pages = math.ceil(total_items / page_size) if page_size > 0 else 0
+            
+            return PaginatedInvoiceResponse(
+                items=results,
+                total=total_items,
+                page=page,
+                page_size=page_size,
+                total_pages=total_pages
+            )
+            
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
@@ -163,7 +214,6 @@ def send_invoice(invoice_id: int):
             pdf_bytes = generate_invoice_pdf(invoice_data)
             
             # Send Email (Mock)
-            # using a dummy email for now as client table doesn't have email field yet
             to_email = "client@example.com" 
             subject = f"Invoice {invoice_data['invoice_no']} from xAI Tutor"
             body = f"Dear {invoice_data['client']['name']},\n\nPlease find attached your invoice.\n\nTotal: ${invoice_data['total']:.2f}"
