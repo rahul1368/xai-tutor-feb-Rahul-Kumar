@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status, Query, Depends
+from fastapi import APIRouter, HTTPException, status, Query, Depends, Request
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
 from datetime import date
@@ -10,11 +10,13 @@ from app.database import get_db
 from app.schemas import InvoiceCreate, InvoiceResponse, PaginatedInvoiceResponse, InvoiceStatusUpdate, ClientResponse, ProductResponse, InvoiceItemResponse
 from app.services.pdf_generator import generate_invoice_pdf
 from app.services.email_service import send_invoice_email
+from app.rate_limiter import limiter
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
 @router.post("", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
-def create_invoice(invoice_data: InvoiceCreate, conn: sqlite3.Connection = Depends(get_db)):
+@limiter.limit("10/minute")
+def create_invoice(request: Request, invoice_data: InvoiceCreate, conn: sqlite3.Connection = Depends(get_db)):
     try:
         cursor = conn.cursor()
 
@@ -82,7 +84,9 @@ def create_invoice(invoice_data: InvoiceCreate, conn: sqlite3.Connection = Depen
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @router.get("", response_model=PaginatedInvoiceResponse)
+@limiter.limit("100/minute")
 def list_invoices(
+    request: Request,
     client_id: Optional[int] = None,
     status: Optional[str] = None,
     date_from: Optional[date] = None,
@@ -184,7 +188,8 @@ def update_invoice_status(invoice_id: int, status_update: InvoiceStatusUpdate, c
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @router.get("/{invoice_id}/pdf")
-def get_invoice_pdf(invoice_id: int, conn: sqlite3.Connection = Depends(get_db)):
+@limiter.limit("5/minute")
+def get_invoice_pdf(request: Request, invoice_id: int, conn: sqlite3.Connection = Depends(get_db)):
     try:
         invoice_data = _get_invoice_internal_dict(conn, invoice_id)
         pdf_bytes = generate_invoice_pdf(invoice_data)
@@ -200,7 +205,8 @@ def get_invoice_pdf(invoice_id: int, conn: sqlite3.Connection = Depends(get_db))
         raise HTTPException(status_code=500, detail=f"Error generating PDF: {str(e)}")
 
 @router.post("/{invoice_id}/send")
-def send_invoice(invoice_id: int, conn: sqlite3.Connection = Depends(get_db)):
+@limiter.limit("5/minute")
+def send_invoice(request: Request, invoice_id: int, conn: sqlite3.Connection = Depends(get_db)):
     try:
         cursor = conn.cursor()
         invoice_data = _get_invoice_internal_dict(conn, invoice_id)

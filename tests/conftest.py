@@ -103,6 +103,23 @@ def client(test_db):
             conn.close()
     
     app.dependency_overrides[get_db] = override_get_db
+    
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+@pytest.fixture(autouse=True)
+def disable_rate_limiting():
+    """
+    Disable rate limiting by default for all tests to prevent functional tests from failing.
+    Individual tests in test_rate_limit.py can re-enable it.
+    """
+    from app.rate_limiter import limiter
+    
+    # Disable limits
+    limiter.enabled = False
+    
+    yield
+    
+    # Restore limits (default valid state)
+    limiter.enabled = True
