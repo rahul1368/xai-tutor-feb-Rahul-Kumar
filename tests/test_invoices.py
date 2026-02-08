@@ -90,3 +90,58 @@ def test_update_status(client):
     response = client.patch(f"/invoices/{invoice_id}/status", json={"status": "PAID"})
     assert response.status_code == status.HTTP_200_OK
     assert response.json()["status"] == "PAID"
+
+def test_filter_by_status(client):
+    # Create DRAFT
+    client.post("/invoices", json={
+        "client_id": 1,
+        "issue_date": "2023-01-01",
+        "due_date": "2023-01-31",
+        "items": [{"product_id": 1, "quantity": 1}]
+    })
+    
+    # Create and set to PAID
+    res = client.post("/invoices", json={
+        "client_id": 1,
+        "issue_date": "2023-01-01",
+        "due_date": "2023-01-31",
+        "items": [{"product_id": 1, "quantity": 1}]
+    })
+    inv_id = res.json()["id"]
+    client.patch(f"/invoices/{inv_id}/status", json={"status": "PAID"})
+    
+    response = client.get("/invoices?status=PAID")
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    assert all(item["status"] == "PAID" for item in data["items"])
+    assert len(data["items"]) >= 1
+
+def test_filter_by_client(client):
+    # Client 1 invoice
+    client.post("/invoices", json={
+        "client_id": 1,
+        "issue_date": "2023-01-01",
+        "due_date": "2023-01-31",
+        "items": [{"product_id": 1, "quantity": 1}]
+    })
+    
+    response = client.get("/invoices?client_id=1")
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    assert all(item["client"]["id"] == 1 for item in data["items"])
+    assert len(data["items"]) >= 1
+
+def test_combined_filters(client):
+    # Create specific target: Client 1, Status DRAFT
+    client.post("/invoices", json={
+        "client_id": 1,
+        "issue_date": "2023-01-01",
+        "due_date": "2023-01-31",
+        "items": [{"product_id": 1, "quantity": 1}]
+    })
+    
+    response = client.get("/invoices?client_id=1&status=DRAFT")
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    assert all(item["client"]["id"] == 1 and item["status"] == "DRAFT" for item in data["items"])
+    assert len(data["items"]) >= 1
