@@ -1,10 +1,11 @@
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, HTTPException, status, Query, Depends
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
 from datetime import date
 import time
 import io
 import math
+import sqlite3
 from app.database import get_db
 from app.schemas import InvoiceCreate, InvoiceResponse, PaginatedInvoiceResponse, InvoiceStatusUpdate, ClientResponse, ProductResponse, InvoiceItemResponse
 from app.services.pdf_generator import generate_invoice_pdf
@@ -13,68 +14,67 @@ from app.services.email_service import send_invoice_email
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
 @router.post("", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
-def create_invoice(invoice_data: InvoiceCreate):
+def create_invoice(invoice_data: InvoiceCreate, conn: sqlite3.Connection = Depends(get_db)):
     try:
-        with get_db() as conn:
-            cursor = conn.cursor()
+        cursor = conn.cursor()
 
-            # 1. Validate Client
-            cursor.execute("SELECT * FROM clients WHERE id = ?", (invoice_data.client_id,))
-            client = cursor.fetchone()
-            if not client:
-                raise HTTPException(status_code=404, detail="Client not found")
+        # 1. Validate Client
+        cursor.execute("SELECT * FROM clients WHERE id = ?", (invoice_data.client_id,))
+        client = cursor.fetchone()
+        if not client:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        # 2. Validate Products and Calculate Total
+        total_amount = 0.0
+        invoice_items_data = []
+
+        for item in invoice_data.items:
+            cursor.execute("SELECT * FROM products WHERE id = ?", (item.product_id,))
+            product = cursor.fetchone()
+            if not product:
+                raise HTTPException(status_code=404, detail=f"Product with ID {item.product_id} not found")
             
-            # 2. Validate Products and Calculate Total
-            total_amount = 0.0
-            invoice_items_data = []
+            line_total = product['price'] * item.quantity
+            total_amount += line_total
+            invoice_items_data.append({
+                "product_id": item.product_id,
+                "quantity": item.quantity,
+                "price": product['price'],
+                "line_total": line_total
+            })
 
-            for item in invoice_data.items:
-                cursor.execute("SELECT * FROM products WHERE id = ?", (item.product_id,))
-                product = cursor.fetchone()
-                if not product:
-                    raise HTTPException(status_code=404, detail=f"Product with ID {item.product_id} not found")
-                
-                line_total = product['price'] * item.quantity
-                total_amount += line_total
-                invoice_items_data.append({
-                    "product_id": item.product_id,
-                    "quantity": item.quantity,
-                    "price": product['price'],
-                    "line_total": line_total
-                })
+        # 3. Calculate Final Total
+        tax = invoice_data.tax_amount if invoice_data.tax_amount is not None else 0.0
+        final_total = total_amount + tax
 
-            # 3. Calculate Final Total
-            tax = invoice_data.tax_amount if invoice_data.tax_amount is not None else 0.0
-            final_total = total_amount + tax
+        # 4. Create Invoice Record
+        import uuid
+        invoice_no = f"INV-{uuid.uuid4().hex[:8].upper()}"
+        address_snapshot = client['address']
 
-            # 4. Create Invoice Record
-            import uuid
-            invoice_no = f"INV-{uuid.uuid4().hex[:8].upper()}"
-            address_snapshot = client['address']
+        cursor.execute("""
+            INSERT INTO invoices (invoice_no, issue_date, due_date, client_id, address, tax, total, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            invoice_no,
+            invoice_data.issue_date.isoformat(),
+            invoice_data.due_date.isoformat(),
+            invoice_data.client_id,
+            address_snapshot,
+            tax,
+            final_total,
+            'DRAFT' # Default status
+        ))
+        invoice_id = cursor.lastrowid
 
+        # 5. Create Invoice Items
+        for item in invoice_data.items:
             cursor.execute("""
-                INSERT INTO invoices (invoice_no, issue_date, due_date, client_id, address, tax, total, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                invoice_no,
-                invoice_data.issue_date.isoformat(),
-                invoice_data.due_date.isoformat(),
-                invoice_data.client_id,
-                address_snapshot,
-                tax,
-                final_total,
-                'DRAFT' # Default status
-            ))
-            invoice_id = cursor.lastrowid
-
-            # 5. Create Invoice Items
-            for item in invoice_data.items:
-                cursor.execute("""
-                    INSERT INTO invoice_items (invoice_id, product_id, quantity)
-                    VALUES (?, ?, ?)
-                """, (invoice_id, item.product_id, item.quantity))
-            
-            return _get_invoice_internal(conn, invoice_id)
+                INSERT INTO invoice_items (invoice_id, product_id, quantity)
+                VALUES (?, ?, ?)
+            """, (invoice_id, item.product_id, item.quantity))
+        
+        return _get_invoice_internal(conn, invoice_id)
 
     except HTTPException:
         raise
@@ -87,143 +87,138 @@ def list_invoices(
     status: Optional[str] = None,
     date_from: Optional[date] = None,
     page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100)
+    page_size: int = Query(10, ge=1, le=100),
+    conn: sqlite3.Connection = Depends(get_db)
 ):
     try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            
-            # Build Query
-            query = "SELECT * FROM invoices"
-            count_query = "SELECT COUNT(*) FROM invoices"
-            params = []
-            conditions = []
-            
-            if client_id:
-                conditions.append("client_id = ?")
-                params.append(client_id)
-            if status:
-                conditions.append("status = ?")
-                params.append(status)
-            if date_from:
-                conditions.append("issue_date >= ?")
-                params.append(date_from.isoformat())
-            
-            if conditions:
-                where_clause = " WHERE " + " AND ".join(conditions)
-                query += where_clause
-                count_query += where_clause
-            
-            # Count total
-            cursor.execute(count_query, params)
-            total_items = cursor.fetchone()[0]
-            
-            # Pagination
-            offset = (page - 1) * page_size
-            query += " LIMIT ? OFFSET ?"
-            params.extend([page_size, offset])
-            
-            # Execute Main Query
-            cursor.execute(query, params)
-            invoices = cursor.fetchall()
-            
-            results = []
-            for invoice in invoices:
-                results.append(_get_invoice_internal(conn, invoice['id']))
-            
-            total_pages = math.ceil(total_items / page_size) if page_size > 0 else 0
-            
-            return PaginatedInvoiceResponse(
-                items=results,
-                total=total_items,
-                page=page,
-                page_size=page_size,
-                total_pages=total_pages
-            )
+        cursor = conn.cursor()
+        
+        # Build Query
+        query = "SELECT * FROM invoices"
+        count_query = "SELECT COUNT(*) FROM invoices"
+        params = []
+        conditions = []
+        
+        if client_id:
+            conditions.append("client_id = ?")
+            params.append(client_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if date_from:
+            conditions.append("issue_date >= ?")
+            params.append(date_from.isoformat())
+        
+        if conditions:
+            where_clause = " WHERE " + " AND ".join(conditions)
+            query += where_clause
+            count_query += where_clause
+        
+        # Count total
+        cursor.execute(count_query, params)
+        total_items = cursor.fetchone()[0]
+        
+        # Pagination
+        offset = (page - 1) * page_size
+        query += " LIMIT ? OFFSET ?"
+        params.extend([page_size, offset])
+        
+        # Execute Main Query
+        cursor.execute(query, params)
+        invoices = cursor.fetchall()
+        
+        results = []
+        for invoice in invoices:
+            results.append(_get_invoice_internal(conn, invoice['id']))
+        
+        total_pages = math.ceil(total_items / page_size) if page_size > 0 else 0
+        
+        return PaginatedInvoiceResponse(
+            items=results,
+            total=total_items,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages
+        )
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @router.get("/{invoice_id}", response_model=InvoiceResponse)
-def get_invoice(invoice_id: int):
+def get_invoice(invoice_id: int, conn: sqlite3.Connection = Depends(get_db)):
     try:
-        with get_db() as conn:
-            return _get_invoice_internal(conn, invoice_id)
+        return _get_invoice_internal(conn, invoice_id)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @router.delete("/{invoice_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_invoice(invoice_id: int):
+def delete_invoice(invoice_id: int, conn: sqlite3.Connection = Depends(get_db)):
     try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM invoices WHERE id = ?", (invoice_id,))
-            if not cursor.fetchone():
-                raise HTTPException(status_code=404, detail="Invoice not found")
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM invoices WHERE id = ?", (invoice_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Invoice not found")
 
-            cursor.execute("DELETE FROM invoice_items WHERE invoice_id = ?", (invoice_id,))
-            cursor.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
+        cursor.execute("DELETE FROM invoice_items WHERE invoice_id = ?", (invoice_id,))
+        cursor.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @router.patch("/{invoice_id}/status", response_model=InvoiceResponse)
-def update_invoice_status(invoice_id: int, status_update: InvoiceStatusUpdate):
+def update_invoice_status(invoice_id: int, status_update: InvoiceStatusUpdate, conn: sqlite3.Connection = Depends(get_db)):
     try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM invoices WHERE id = ?", (invoice_id,))
-            if not cursor.fetchone():
-                raise HTTPException(status_code=404, detail="Invoice not found")
-            
-            cursor.execute("UPDATE invoices SET status = ? WHERE id = ?", (status_update.status, invoice_id))
-            return _get_invoice_internal(conn, invoice_id)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM invoices WHERE id = ?", (invoice_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Invoice not found")
+        
+        cursor.execute("UPDATE invoices SET status = ? WHERE id = ?", (status_update.status, invoice_id))
+        return _get_invoice_internal(conn, invoice_id)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @router.get("/{invoice_id}/pdf")
-def get_invoice_pdf(invoice_id: int):
+def get_invoice_pdf(invoice_id: int, conn: sqlite3.Connection = Depends(get_db)):
     try:
-        with get_db() as conn:
-            invoice_data = _get_invoice_internal_dict(conn, invoice_id)
-            pdf_bytes = generate_invoice_pdf(invoice_data)
-            
-            return StreamingResponse(
-                io.BytesIO(pdf_bytes), 
-                media_type="application/pdf",
-                headers={"Content-Disposition": f"attachment; filename=invoice_{invoice_data['invoice_no']}.pdf"}
-            )
+        invoice_data = _get_invoice_internal_dict(conn, invoice_id)
+        pdf_bytes = generate_invoice_pdf(invoice_data)
+        
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes), 
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=invoice_{invoice_data['invoice_no']}.pdf"}
+        )
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating PDF: {str(e)}")
 
 @router.post("/{invoice_id}/send")
-def send_invoice(invoice_id: int):
+def send_invoice(invoice_id: int, conn: sqlite3.Connection = Depends(get_db)):
     try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            invoice_data = _get_invoice_internal_dict(conn, invoice_id)
-            
-            # Generate PDF
-            pdf_bytes = generate_invoice_pdf(invoice_data)
-            
-            # Send Email (Mock)
-            to_email = "client@example.com" 
-            subject = f"Invoice {invoice_data['invoice_no']} from xAI Tutor"
-            body = f"Dear {invoice_data['client']['name']},\n\nPlease find attached your invoice.\n\nTotal: ${invoice_data['total']:.2f}"
-            
-            send_invoice_email(to_email, subject, body, pdf_bytes)
-            
-            # Update Status to SENT
-            cursor.execute("UPDATE invoices SET status = 'SENT' WHERE id = ?", (invoice_id,))
-            
-            return {"message": "Invoice sent successfully", "status": "SENT"}
+        cursor = conn.cursor()
+        invoice_data = _get_invoice_internal_dict(conn, invoice_id)
+        
+        # Generate PDF
+        pdf_bytes = generate_invoice_pdf(invoice_data)
+        
+        # Send Email (Mock)
+        to_email = "client@example.com" 
+        subject = f"Invoice {invoice_data['invoice_no']} from xAI Tutor"
+        body = f"Dear {invoice_data['client']['name']},\n\nPlease find attached your invoice.\n\nTotal: ${invoice_data['total']:.2f}"
+        
+        send_invoice_email(to_email, subject, body, pdf_bytes)
+        
+        # Update Status to SENT
+        cursor.execute("UPDATE invoices SET status = 'SENT' WHERE id = ?", (invoice_id,))
+        
+        return {"message": "Invoice sent successfully", "status": "SENT"}
     except HTTPException:
         raise
     except Exception as e:
